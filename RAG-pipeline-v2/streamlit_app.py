@@ -67,7 +67,7 @@ def create_rag_chain(_vectorstore, score_threshold=0.8):
 
     retriever = _vectorstore.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.4},
+        search_kwargs={"k": 10, "score_threshold": 0.2},
     )
 
     web_search_tool = TavilySearchResults(max_results=10)
@@ -127,7 +127,7 @@ def create_rag_chain(_vectorstore, score_threshold=0.8):
     return rag_chain
 
 st.markdown(
-    '<h1 style="color: #0077be;">JW Research Chat (Llama3, RAG and JW.Org)</h1>',
+    '<h1 style="color: #0077be;">JW Research (LLM, RAG and JW.Org)</h1>',
     unsafe_allow_html=True
 )
 
@@ -137,7 +137,7 @@ score_threshold = st.sidebar.slider(
     "Web Relevance Threshold", 
     min_value=0.0, 
     max_value=1.0, 
-    value=0.3, 
+    value=0.4, 
     step=0.05,
     help="Adjust how relevant web search results must be to be included. Lower values include more results."
 )
@@ -175,21 +175,38 @@ if prompt := st.chat_input("What is your question?"):
                 with st.expander("Sources"):
                     if retrieved_docs:
                         st.markdown("**Local Documents:**")
+                        # Group pages by source document
+                        source_pages = {}
                         for doc in retrieved_docs:
-                            st.markdown(f"- {os.path.basename(doc.metadata.get('source', 'Unknown'))}")
+                            source_file = os.path.basename(doc.metadata.get("source", "Unknown"))
+                            page_num = doc.metadata.get("page", -1)
+                            if source_file not in source_pages:
+                                source_pages[source_file] = set()
+                            if page_num != -1:
+                                # Add 1 to page number as it's often 0-indexed
+                                source_pages[source_file].add(str(page_num + 1))
+                        
+                        # Display the grouped sources
+                        for source_file, pages in sorted(source_pages.items()):
+                            if pages:
+                                page_str = ", ".join(sorted(list(pages), key=int))
+                                st.markdown(f"- {source_file} (pages: {page_str})")
+                            else:
+                                st.markdown(f"- {source_file}")
+
                     if web_results:
                         st.markdown("**Web Results:**")
                         for result in web_results:
                             st.markdown(f"- {result.get('url', 'N/A')}")
             
             # --- Display Debugging Info ---
-            # with st.expander("Debugging Info"):
-            #     st.markdown("### Raw Web Search Results")
-            #     st.json(sources.get("web_results_raw", []))
-            #     st.markdown("### After Filtering for JW.ORG")
-            #     st.json(sources.get("web_results_jw_filtered", []))
-            #     st.markdown("### Final Web Results (After Score Filter)")
-            #     st.json(sources.get("web_results_final", []))
+            with st.expander("Debugging Info"):
+                st.markdown("### Raw Web Search Results")
+                st.json(sources.get("web_results_raw", []))
+                st.markdown("### After Filtering for JW.ORG")
+                st.json(sources.get("web_results_jw_filtered", []))
+                st.markdown("### Final Web Results (After Score Filter)")
+                st.json(sources.get("web_results_final", []))
 
             st.session_state.messages.append({"role": "assistant", "content": answer_content})
 
