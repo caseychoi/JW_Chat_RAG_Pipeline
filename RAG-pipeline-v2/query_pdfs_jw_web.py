@@ -41,7 +41,8 @@ PG_CONN = f"postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB
 RAG_PROMPT_TEMPLATE = """
 You are a research assistant. Use the following retrieved context from local documents and web search results to answer the question.
 If you don't know the answer from the context, just say that you don't know.
-Do not use any outside knowledge. Provide scriptural citations if they are present in the context.
+Do not use any outside knowledge. Use only the local vector store and those found in www.jw.org.
+Provide scriptural citations if they are present in the context.
 
 CONTEXT:
 {context}
@@ -135,18 +136,18 @@ def create_rag_chain(vectorstore):
             
         return "Could not format documents."
 
-    # The final chain, now more efficient
-    rag_chain = (
-        {
-            "context": combined_retriever, # Runs the parallel retrievers
-            "input": itemgetter("input")  # Passes the original input string through
-        }
-        | RunnablePassthrough.assign(
-            # Format the combined context from both sources into a single string
-            context=lambda x: f"--- Local Documents ---\n{format_docs(x['context']['retrieved_docs'])}\n\n--- Web Search Results ---\n{format_docs(x['context']['web_results'])}"
-        )
-        | prompt
-        | llm
+    # The final chain is a parallel execution of the RAG pipeline and a pass-through for the context.
+    rag_chain = RunnableParallel(
+        {"context": combined_retriever, "input": itemgetter("input")}
+    ) | RunnableParallel(
+        answer=(
+            RunnablePassthrough.assign(
+                context=lambda x: f"--- Local Documents ---\n{format_docs(x['context']['retrieved_docs'])}\n\n--- Web Search Results ---\n{format_docs(x['context']['web_results'])}"
+            )
+            | prompt
+            | llm
+        ),
+        sources=itemgetter("context"),
     )
     
     print("RAG chain created.")
@@ -169,15 +170,38 @@ def run_chatbot(rag_chain):
             break
 
         try:
-            # The chain now expects a dictionary with an "input" key
-            response_generator = rag_chain.stream({"input": query})
+            # The chain now returns a dictionary with "answer" and "sources"
+            response = rag_chain.invoke({"input": query})
             
             print("\nChatBot: ", end="", flush=True)
-            full_response = ""
-            for chunk in response_generator:
-                print(chunk.content, end="", flush=True)
-                full_response += chunk.content
-            print() # Newline after streaming is complete
+            # The answer is now a single object, not a generator
+            answer = response.get("answer", "")
+            if hasattr(answer, 'content'):
+                print(answer.content)
+            else:
+                print(answer)
+
+            # --- Print Sources ---
+            sources = response.get("sources", {})
+            retrieved_docs = sources.get("retrieved_docs", [])
+            web_results = sources.get("web_results", [])
+
+            if retrieved_docs or web_results:
+                print("\n--- Sources ---")
+                # Print local document sources
+                if retrieved_docs:
+                    print("Local Documents:")
+                    for doc in retrieved_docs:
+                        source = doc.metadata.get("source", "Unknown")
+                        print(f"- {os.path.basename(source)}")
+
+                # Print web search sources
+                if web_results:
+                    print("\nWeb Results:")
+                    for result in web_results:
+                        url = result.get("url", "N/A")
+                        print(f"- {url}")
+            # --------------------
 
         except Exception as e:
             print(f"Bot: An error occurred while answering: {e}")
