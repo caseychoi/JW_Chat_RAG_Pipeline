@@ -30,7 +30,8 @@ RAG_PROMPT_TEMPLATE = """
 You are a research assistant. Use the following retrieved context from local documents and web search results to answer the question.
 If you don't know the answer from the context, just say that you don't know.
 Do not use any outside knowledge. Use only the local vector store and those found in www.jw.org.
-Provide scriptural citations if they are present in the context.
+If there is a conflict or overlap between the local documents and the web search results, you must prioritize the information from the web search results from www.jw.org.
+Always make sure to include scriptural citations if they are present in the context.
 
 CONTEXT:
 {context}
@@ -59,32 +60,50 @@ def get_vectorstore(collection_name):
     return vectorstore
 
 @st.cache_resource
-def create_rag_chain(_vectorstore):
+def create_rag_chain(_vectorstore, score_threshold=0.8):
     """Creates a RAG chain that queries local docs and the web in parallel."""
     llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
     prompt = ChatPromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
 
     retriever = _vectorstore.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.2},
+        search_kwargs={"k": 10, "score_threshold": 0.4},
     )
 
-    web_search_tool = TavilySearchResults(max_results=5)
+    web_search_tool = TavilySearchResults(max_results=10)
     local_retriever_chain = itemgetter("input") | retriever
-    web_search_chain = (
+
+    def filter_jw_org_only(docs):
+        if not isinstance(docs, list): return []
+        return [doc for doc in docs if "jw.org" in doc.get("url", "")]
+
+    def filter_by_score(docs):
+        if not isinstance(docs, list): return []
+        return [doc for doc in docs if doc.get("score", 0) >= score_threshold]
+
+    # --- Debuggable Web Search Chain ---
+    # 1. Initial search
+    raw_web_search_chain = (
         itemgetter("input")
         | RunnableLambda(lambda q: q + " site:www.jw.org")
         | web_search_tool
     )
+    # 2. Filter for jw.org
+    jw_filtered_chain = raw_web_search_chain | RunnableLambda(filter_jw_org_only)
+    # 3. Filter by score
+    score_filtered_chain = jw_filtered_chain | RunnableLambda(filter_by_score)
+    # ---
 
     combined_retriever = RunnableParallel(
         retrieved_docs=local_retriever_chain,
-        web_results=web_search_chain,
+        web_results_final=score_filtered_chain,
+        # Pass through the intermediate steps for debugging
+        web_results_raw=raw_web_search_chain,
+        web_results_jw_filtered=jw_filtered_chain,
     )
 
     def format_docs(docs):
-        if not docs:
-            return "No information found."
+        if not docs: return "No information found."
         if isinstance(docs[0], Document):
             return "\n\n".join(doc.page_content for doc in docs)
         elif isinstance(docs[0], dict):
@@ -93,12 +112,12 @@ def create_rag_chain(_vectorstore):
             return docs
         return "Could not format documents."
 
-    rag_chain = RunnableParallel(
+    rag_chain = (
         {"context": combined_retriever, "input": itemgetter("input")}
     ) | RunnableParallel(
         answer=(
             RunnablePassthrough.assign(
-                context=lambda x: f"--- Local Documents ---\n{format_docs(x['context']['retrieved_docs'])}\n\n--- Web Search Results ---\n{format_docs(x['context']['web_results'])}"
+                context=lambda x: f"--- Local Documents ---\n{format_docs(x['context']['retrieved_docs'])}\n\n--- Web Search Results ---\n{format_docs(x['context']['web_results_final'])}"
             )
             | prompt
             | llm
@@ -107,7 +126,21 @@ def create_rag_chain(_vectorstore):
     )
     return rag_chain
 
-st.title("JW Chat")
+st.markdown(
+    '<h1 style="color: #0077be;">JW Research Chat (Llama3, RAG and JW.Org)</h1>',
+    unsafe_allow_html=True
+)
+
+# --- UI Elements ---
+st.sidebar.title("Settings")
+score_threshold = st.sidebar.slider(
+    "Web Relevance Threshold", 
+    min_value=0.0, 
+    max_value=1.0, 
+    value=0.3, 
+    step=0.05,
+    help="Adjust how relevant web search results must be to be included. Lower values include more results."
+)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -125,37 +158,40 @@ if prompt := st.chat_input("What is your question?"):
         try:
             collection_name = _auto_collection_name()
             vectorstore = get_vectorstore(collection_name)
-            rag_chain = create_rag_chain(vectorstore)
+            rag_chain = create_rag_chain(vectorstore, score_threshold)
             
             response = rag_chain.invoke({"input": prompt})
             
             answer = response.get("answer", "")
-            if hasattr(answer, 'content'):
-                answer_content = answer.content
-            else:
-                answer_content = str(answer)
-
+            answer_content = answer.content if hasattr(answer, 'content') else str(answer)
             st.markdown(answer_content)
             
+            # --- Display Final Sources ---
             sources = response.get("sources", {})
             retrieved_docs = sources.get("retrieved_docs", [])
-            web_results = sources.get("web_results", [])
+            web_results = sources.get("web_results_final", [])
 
             if retrieved_docs or web_results:
                 with st.expander("Sources"):
                     if retrieved_docs:
                         st.markdown("**Local Documents:**")
                         for doc in retrieved_docs:
-                            source = doc.metadata.get("source", "Unknown")
-                            st.markdown(f"- {os.path.basename(source)}")
+                            st.markdown(f"- {os.path.basename(doc.metadata.get('source', 'Unknown'))}")
                     if web_results:
                         st.markdown("**Web Results:**")
                         for result in web_results:
-                            url = result.get("url", "N/A")
-                            st.markdown(f"- {url}")
+                            st.markdown(f"- {result.get('url', 'N/A')}")
             
+            # --- Display Debugging Info ---
+            # with st.expander("Debugging Info"):
+            #     st.markdown("### Raw Web Search Results")
+            #     st.json(sources.get("web_results_raw", []))
+            #     st.markdown("### After Filtering for JW.ORG")
+            #     st.json(sources.get("web_results_jw_filtered", []))
+            #     st.markdown("### Final Web Results (After Score Filter)")
+            #     st.json(sources.get("web_results_final", []))
+
             st.session_state.messages.append({"role": "assistant", "content": answer_content})
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
-
