@@ -1,0 +1,6 @@
+psycopg
+langchain
+langchain_community
+langchain_ollama
+langchain_postgres
+PyMuPDF
