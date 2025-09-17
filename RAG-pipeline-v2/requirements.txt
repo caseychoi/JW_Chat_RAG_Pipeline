@@ -1,0 +1,7 @@
+streamlit
+requests
+langdetect
+psycopg
+langchain-core
+langchain-ollama
+langchain-postgres
