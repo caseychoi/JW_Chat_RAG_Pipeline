@@ -23,7 +23,7 @@ PG_CONN = f"postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB
 
 # Optional: set to "1" to drop an existing collection before reindexing
 #RESET_COLLECTION = os.getenv("RESET_COLLECTION", "0") == "1"
-RESET_COLLECTION = False
+RESET_COLLECTION = True
 
 def _auto_collection_name(base="documents", embed_model=EMBEDDING_MODEL):
     """Generates a collection name based on the embedding model."""
@@ -54,6 +54,20 @@ def load_and_split_documents(pdf_directory):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
     docs = text_splitter.split_documents(all_docs_loaded)
     print(f"Split {len(all_docs_loaded)} document pages into {len(docs)} chunks.")
+    
+    # Truncate page_content and clean metadata to avoid database errors
+    for doc in docs:
+        if len(doc.page_content) > 5000:
+            doc.page_content = doc.page_content[:5000] + "..."
+        # Clean metadata: remove large values
+        cleaned_metadata = {}
+        for k, v in doc.metadata.items():
+            if isinstance(v, str) and len(v) > 1000:
+                cleaned_metadata[k] = v[:1000] + "..."
+            else:
+                cleaned_metadata[k] = v
+        doc.metadata = cleaned_metadata
+    
     return docs
 
 # --- Optional: drop a single collection (cleanup/reset) ---
@@ -64,18 +78,21 @@ def drop_collection_if_requested(collection_name: str):
     print(f"RESET_COLLECTION is set. Dropping collection '{collection_name}'...")
     with psycopg.connect(f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}") as conn:
         with conn.cursor() as cur:
-            # Find the collection's UUID
-            cur.execute("SELECT uuid FROM langchain_pg_collection WHERE name = %s", (collection_name,))
-            row = cur.fetchone()
-            if not row:
-                print("Collection not found; nothing to drop.")
-                return
-            
-            collection_id = row[0]
-            # Delete associated embeddings and the collection entry
-            cur.execute("DELETE FROM langchain_pg_embedding WHERE collection_id = %s", (collection_id,))
-            cur.execute("DELETE FROM langchain_pg_collection WHERE uuid = %s", (collection_id,))
-            print("Collection dropped successfully.")
+            try:
+                # Find the collection's UUID
+                cur.execute("SELECT uuid FROM langchain_pg_collection WHERE name = %s", (collection_name,))
+                row = cur.fetchone()
+                if not row:
+                    print("Collection not found; nothing to drop.")
+                    return
+                
+                collection_id = row[0]
+                # Delete associated embeddings and the collection entry
+                cur.execute("DELETE FROM langchain_pg_embedding WHERE collection_id = %s", (collection_id,))
+                cur.execute("DELETE FROM langchain_pg_collection WHERE uuid = %s", (collection_id,))
+                print("Collection dropped successfully.")
+            except psycopg.errors.UndefinedTable:
+                print("Collection tables do not exist; nothing to drop.")
         conn.commit()
 
 # --- 2) Embedding & vector store creation ---
@@ -84,13 +101,21 @@ def create_vector_store(docs, collection_name):
     print(f"Creating vector store (collection='{collection_name}')...")
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 
-    PGVector.from_documents(
-        documents=docs,
-        embedding=embeddings,
+    # Create vector store without documents first
+    vector_store = PGVector(
+        embeddings=embeddings,
         collection_name=collection_name,
         connection=PG_CONN,
         use_jsonb=True,
     )
+    
+    # Add documents in batches to avoid bulk insert limits
+    batch_size = 1000
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i:i + batch_size]
+        print(f"Adding batch {i//batch_size + 1}/{(len(docs) + batch_size - 1)//batch_size} ({len(batch)} documents)...")
+        vector_store.add_documents(batch)
+    
     print("Vector store created and populated successfully.")
 
 # --- Main Execution ---
